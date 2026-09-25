@@ -300,7 +300,12 @@ app.post(
 
 app.get('/api/v1/stats', async (_req, res) => {
   try {
-    const snapshot = await logsCollection.get();
+    // Keep dashboard stats bounded. A full collection scan here was repeated
+    // on every dashboard refresh and grew in cost with the log history.
+    const [countSnapshot, snapshot] = await Promise.all([
+      logsCollection.count().get(),
+      logsCollection.orderBy('created_at', 'desc').limit(100).get(),
+    ]);
     const logs = snapshot.docs.map((doc) => doc.data());
     const endpointMap = new Map();
     const platformMap = new Map();
@@ -339,7 +344,7 @@ app.get('/api/v1/stats', async (_req, res) => {
       .sort((a, b) => b.total - a.total);
 
     return res.json({
-      total: logs.length,
+      total: countSnapshot.data().count,
       errors,
       avgMs: durationCount ? Math.round(durationTotal / durationCount) : 0,
       topEndpoints,
@@ -393,7 +398,10 @@ app.get('/api/v1/logs', async (req, res) => {
       0
     );
 
-    const snapshot = await logsCollection.orderBy('created_at', 'desc').get();
+    // Search is applied in memory, so cap its candidate set to recent records
+    // rather than downloading the entire history on every request.
+    const candidateLimit = Math.min(Math.max(offset + limit, 100), 500);
+    const snapshot = await logsCollection.orderBy('created_at', 'desc').limit(candidateLimit).get();
     let logs = snapshot.docs.map(serializeLog);
     if (req.query.status) {
       const status = Number(req.query.status);
