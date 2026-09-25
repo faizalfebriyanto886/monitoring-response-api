@@ -4,7 +4,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-import { pool, initDb } from './db.js';
+import { logsCollection, initDb } from './db.js';
 
 dotenv.config();
 
@@ -70,9 +70,7 @@ app.use(
 /**
  * Convert undefined to null.
  */
-const clean = (value) => {
-  return value === undefined ? null : value;
-};
+const clean = (value) => value === undefined ? null : value;
 
 /**
  * Check whether HTTP status is an error.
@@ -87,30 +85,22 @@ const isErrorStatus = (statusCode) => {
   );
 };
 
-/**
- * Safely parse JSON value.
- *
- * PostgreSQL JSONB accepts:
- * - object
- * - array
- * - primitive JSON values
- *
- * If Flutter sends a string, keep it as a string.
- */
-const normalizeJson = (value) => {
-  if (value === undefined || value === null) return null;
+const serializeLog = (snapshot) => {
+  const data = snapshot.data();
+  return {
+    id: snapshot.id,
+    ...data,
+    created_at: data.created_at?.toDate
+      ? data.created_at.toDate().toISOString()
+      : data.created_at ?? null,
+  };
+};
 
-  if (typeof value === 'string') {
-    try {
-      JSON.parse(value);      // string ini sudah JSON valid
-      return value;
-    } catch {
-      return JSON.stringify(value); // bungkus jadi JSON string
-    }
-  }
-
-  // object & array: selalu kirim sebagai teks JSON
-  return JSON.stringify(value);
+const asDate = (value) => {
+  if (!value) return null;
+  if (value.toDate) return value.toDate();
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
 };
 
 /**
@@ -145,7 +135,7 @@ const auth = (req, res, next) => {
 
 app.get('/health', async (_req, res) => {
   try {
-    await pool.query('SELECT 1');
+    await logsCollection.limit(1).get();
 
     return res.json({
       success: true,
@@ -252,115 +242,37 @@ app.post(
           ? `API returned HTTP ${statusCode}`
           : null);
 
-      /**
-       * SQL
-       */
-      const query = `
-        INSERT INTO api_logs (
-          app_name,
-          app_version,
-          build_number,
-          platform,
-          os_version,
-          device_model,
-          user_id,
-          method,
-          url,
-          endpoint,
-          status_code,
-          duration_ms,
-          request_headers,
-          request_body,
-          response_headers,
-          response_body,
-          error_type,
-          error_message,
-          ip_address
-        )
-        VALUES (
-          $1,
-          $2,
-          $3,
-          $4,
-          $5,
-          $6,
-          $7,
-          $8,
-          $9,
-          $10,
-          $11,
-          $12,
-          $13,
-          $14,
-          $15,
-          $16,
-          $17,
-          $18,
-          $19
-        )
-        RETURNING id, created_at
-      `;
-
-      /**
-       * Values
-       */
-      const values = [
-        clean(data.app_name),
-        clean(data.app_version),
-        clean(data.build_number),
-
-        clean(data.platform),
-        clean(data.os_version),
-        clean(data.device_model),
-
-        clean(data.user_id),
-
-        data.method,
-        data.url,
-
-        clean(data.endpoint),
-
-        statusCode,
-
-        data.duration_ms !== undefined
+      const createdAt = new Date();
+      const log = {
+        app_name: clean(data.app_name),
+        app_version: clean(data.app_version),
+        build_number: clean(data.build_number),
+        platform: clean(data.platform),
+        os_version: clean(data.os_version),
+        device_model: clean(data.device_model),
+        user_id: clean(data.user_id),
+        method: data.method,
+        url: data.url,
+        endpoint: clean(data.endpoint),
+        status_code: statusCode,
+        duration_ms: data.duration_ms !== undefined && Number.isFinite(Number(data.duration_ms))
           ? Number(data.duration_ms)
           : null,
-
-        normalizeJson(
-          data.request_headers
-        ),
-
-        normalizeJson(
-          data.request_body
-        ),
-
-        normalizeJson(
-          data.response_headers
-        ),
-
-        normalizeJson(
-          data.response_body
-        ),
-
-        errorType,
-        errorMessage,
-
-        req.ip,
-      ];
-
-      /**
-       * Insert
-       */
-      const result = await pool.query(
-        query,
-        values
-      );
+        request_headers: clean(data.request_headers),
+        request_body: clean(data.request_body),
+        response_headers: clean(data.response_headers),
+        response_body: clean(data.response_body),
+        error_type: errorType,
+        error_message: errorMessage,
+        ip_address: req.ip,
+        created_at: createdAt,
+      };
+      const result = await logsCollection.add(log);
 
       return res.status(201).json({
         success: true,
-        id: result.rows[0].id,
-        created_at:
-          result.rows[0].created_at,
+        id: result.id,
+        created_at: createdAt.toISOString(),
         is_error: isError,
       });
     } catch (error) {
@@ -388,109 +300,50 @@ app.post(
 
 app.get('/api/v1/stats', async (_req, res) => {
   try {
-    const [
-      totalResult,
-      errorsResult,
-      avgResult,
-      topEndpointsResult,
-      platformsResult,
-    ] = await Promise.all([
-      /**
-       * Total requests
-       */
-      pool.query(`
-        SELECT
-          COUNT(*)::int AS total
-        FROM api_logs
-      `),
+    const snapshot = await logsCollection.get();
+    const logs = snapshot.docs.map((doc) => doc.data());
+    const endpointMap = new Map();
+    const platformMap = new Map();
+    let errors = 0;
+    let durationTotal = 0;
+    let durationCount = 0;
 
-      /**
-       * Total errors
-       *
-       * 400+
-       */
-      pool.query(`
-        SELECT
-          COUNT(*)::int AS total
-        FROM api_logs
-        WHERE status_code >= 400
-      `),
+    for (const log of logs) {
+      if (Number(log.status_code) >= 400) errors += 1;
+      if (log.duration_ms !== null && log.duration_ms !== undefined && Number.isFinite(Number(log.duration_ms))) {
+        durationTotal += Number(log.duration_ms);
+        durationCount += 1;
+      }
+      const endpoint = log.endpoint || '';
+      const endpointStats = endpointMap.get(endpoint) || { endpoint, total: 0, errors: 0, durationTotal: 0, durationCount: 0 };
+      endpointStats.total += 1;
+      if (Number(log.status_code) >= 400) endpointStats.errors += 1;
+      if (log.duration_ms !== null && log.duration_ms !== undefined && Number.isFinite(Number(log.duration_ms))) {
+        endpointStats.durationTotal += Number(log.duration_ms);
+        endpointStats.durationCount += 1;
+      }
+      endpointMap.set(endpoint, endpointStats);
+      const platform = log.platform || 'unknown';
+      platformMap.set(platform, (platformMap.get(platform) || 0) + 1);
+    }
 
-      /**
-       * Average response time
-       */
-      pool.query(`
-        SELECT
-          COALESCE(
-            ROUND(AVG(duration_ms)),
-            0
-          )::int AS avg
-        FROM api_logs
-        WHERE duration_ms IS NOT NULL
-      `),
-
-      /**
-       * Top endpoints
-       */
-      pool.query(`
-        SELECT
-          COALESCE(endpoint, '') AS endpoint,
-
-          COUNT(*)::int AS total,
-
-          COUNT(*) FILTER (
-            WHERE status_code >= 400
-          )::int AS errors,
-
-          COALESCE(
-            ROUND(AVG(duration_ms)),
-            0
-          )::int AS avg_ms
-
-        FROM api_logs
-
-        GROUP BY endpoint
-
-        ORDER BY total DESC
-
-        LIMIT 10
-      `),
-
-      /**
-       * Platform statistics
-       */
-      pool.query(`
-        SELECT
-          COALESCE(
-            platform,
-            'unknown'
-          ) AS platform,
-
-          COUNT(*)::int AS total
-
-        FROM api_logs
-
-        GROUP BY platform
-
-        ORDER BY total DESC
-      `),
-    ]);
+    const topEndpoints = [...endpointMap.values()]
+      .map(({ durationTotal: total, durationCount: count, ...item }) => ({
+        ...item,
+        avg_ms: count ? Math.round(total / count) : 0,
+      }))
+      .sort((a, b) => b.total - a.total)
+      .slice(0, 10);
+    const platforms = [...platformMap.entries()]
+      .map(([platform, total]) => ({ platform, total }))
+      .sort((a, b) => b.total - a.total);
 
     return res.json({
-      total:
-        totalResult.rows[0].total,
-
-      errors:
-        errorsResult.rows[0].total,
-
-      avgMs:
-        avgResult.rows[0].avg,
-
-      topEndpoints:
-        topEndpointsResult.rows,
-
-      platforms:
-        platformsResult.rows,
+      total: logs.length,
+      errors,
+      avgMs: durationCount ? Math.round(durationTotal / durationCount) : 0,
+      topEndpoints,
+      platforms,
     });
   } catch (error) {
     console.error(
@@ -540,152 +393,19 @@ app.get('/api/v1/logs', async (req, res) => {
       0
     );
 
-    /**
-     * Query values
-     */
-    const values = [];
-
-    /**
-     * WHERE conditions
-     */
-    const conditions = [];
-
-    /**
-     * Helper for dynamic conditions
-     */
-    const addCondition = (
-      sql,
-      value
-    ) => {
-      values.push(value);
-
-      const parameter =
-        `$${values.length}`;
-
-      conditions.push(
-        sql.replace(
-          '$X',
-          parameter
-        )
-      );
-    };
-
-    /**
-     * Status filter
-     *
-     * Example:
-     *
-     * ?status=500
-     */
+    const snapshot = await logsCollection.orderBy('created_at', 'desc').get();
+    let logs = snapshot.docs.map(serializeLog);
     if (req.query.status) {
-      const status = Number(
-        req.query.status
-      );
-
-      if (!Number.isNaN(status)) {
-        addCondition(
-          'status_code = $X',
-          status
-        );
-      }
+      const status = Number(req.query.status);
+      if (Number.isFinite(status)) logs = logs.filter((log) => Number(log.status_code) === status);
     }
-
-    /**
-     * Platform filter
-     */
-    if (req.query.platform) {
-      addCondition(
-        'platform = $X',
-        req.query.platform
-      );
-    }
-
-    /**
-     * App version filter
-     */
-    if (req.query.app_version) {
-      addCondition(
-        'app_version = $X',
-        req.query.app_version
-      );
-    }
-
-    /**
-     * Search endpoint / URL
-     */
+    if (req.query.platform) logs = logs.filter((log) => log.platform === req.query.platform);
+    if (req.query.app_version) logs = logs.filter((log) => log.app_version === req.query.app_version);
     if (req.query.search) {
-      addCondition(
-        `
-        (
-          endpoint ILIKE $X
-          OR url ILIKE $X
-        )
-        `,
-        `%${req.query.search}%`
-      );
+      const search = String(req.query.search).toLowerCase();
+      logs = logs.filter((log) => `${log.endpoint || ''} ${log.url || ''}`.toLowerCase().includes(search));
     }
-
-    /**
-     * WHERE SQL
-     */
-    const whereSql =
-      conditions.length > 0
-        ? `
-          WHERE
-          ${conditions.join(
-            ' AND '
-          )}
-        `
-        : '';
-
-    /**
-     * Main query
-     *
-     * IMPORTANT:
-     * Response is an ARRAY directly.
-     *
-     * This matches the existing
-     * dashboard frontend.
-     */
-    const query = `
-      SELECT
-        id,
-        app_name,
-        app_version,
-        build_number,
-        platform,
-        os_version,
-        device_model,
-        user_id,
-        method,
-        url,
-        endpoint,
-        status_code,
-        duration_ms,
-        request_headers,
-        request_body,
-        response_headers,
-        response_body,
-        error_type,
-        error_message,
-        ip_address,
-        created_at
-
-      FROM api_logs
-
-      ${whereSql}
-
-      ORDER BY created_at DESC
-
-      LIMIT ${limit}
-
-      OFFSET ${offset}
-    `;
-
-    const result = await pool.query(
-      query,
-      values
-    );
+    logs = logs.slice(offset, offset + limit);
 
     /**
      * IMPORTANT:
@@ -701,7 +421,7 @@ app.get('/api/v1/logs', async (req, res) => {
      * expects an array.
      */
     return res.json(
-      result.rows
+      logs
     );
   } catch (error) {
     console.error(
@@ -729,18 +449,9 @@ app.get(
   '/api/v1/logs/:id',
   async (req, res) => {
     try {
-      const result =
-        await pool.query(
-          `
-          SELECT
-            *
-          FROM api_logs
-          WHERE id = $1
-          `,
-          [req.params.id]
-        );
+      const result = await logsCollection.doc(req.params.id).get();
 
-      if (!result.rowCount) {
+      if (!result.exists) {
         return res.status(404).json({
           success: false,
           message: 'Log not found',
@@ -749,7 +460,7 @@ app.get(
 
       return res.json({
         success: true,
-        data: result.rows[0],
+        data: serializeLog(result),
       });
     } catch (error) {
       console.error(
@@ -778,15 +489,19 @@ app.delete(
   '/api/v1/logs',
   async (_req, res) => {
     try {
-      const result =
-        await pool.query(`
-          DELETE FROM api_logs
-        `);
+      let deleted = 0;
+      while (true) {
+        const snapshot = await logsCollection.limit(450).get();
+        if (snapshot.empty) break;
+        const batch = logsCollection.firestore.batch();
+        snapshot.docs.forEach((doc) => batch.delete(doc.ref));
+        await batch.commit();
+        deleted += snapshot.size;
+      }
 
       return res.json({
         success: true,
-        deleted:
-          result.rowCount,
+        deleted,
       });
     } catch (error) {
       console.error(
