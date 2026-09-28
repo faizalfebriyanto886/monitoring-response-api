@@ -173,7 +173,7 @@ app.get('/health', async (_req, res) => {
 
 app.post(
   [
-    '/api/v1/logs',
+    // '/api/v1/logs',
     '/api/v1/mobile-monitoring/logs',
   ],
   auth,
